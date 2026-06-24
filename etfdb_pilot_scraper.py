@@ -176,6 +176,18 @@ def load_existing_records(path: Path) -> dict[str, dict[str, Any]]:
     return records
 
 
+def load_tickers_file(path: Path) -> list[str]:
+    tickers = []
+    seen = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        ticker = line.strip().upper()
+        if not ticker or ticker.startswith("#") or ticker in seen:
+            continue
+        tickers.append(ticker)
+        seen.add(ticker)
+    return tickers
+
+
 def append_checkpoint(path: Path, ticker: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
@@ -671,15 +683,30 @@ def main() -> int:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--diagnostics", action="store_true", help="check access only; do not fetch ETF detail pages")
     parser.add_argument("--parse-cache", action="store_true", help="rebuild outputs from cached raw HTML without network access")
+    parser.add_argument("--tickers-file", type=Path, help="newline-delimited ticker list for non-pilot batches")
+    parser.add_argument("--batch-start", type=int, default=0, help="0-based start offset when using --tickers-file")
+    parser.add_argument("--batch-size", type=int, help="number of tickers to process from --tickers-file")
     args = parser.parse_args()
     if args.diagnostics:
         return run_diagnostics(args)
-    if not 10 <= args.limit <= 25:
+    if args.tickers_file:
+        all_tickers = load_tickers_file(args.tickers_file)
+        if args.batch_start < 0:
+            parser.error("--batch-start must be non-negative")
+        batch_size = args.batch_size if args.batch_size is not None else (len(all_tickers) if args.parse_cache else args.limit)
+        max_batch_size = len(all_tickers) if args.parse_cache else 100
+        if not 1 <= batch_size <= max_batch_size:
+            parser.error(f"--batch-size must be between 1 and {max_batch_size}")
+        tickers = all_tickers[args.batch_start:args.batch_start + batch_size]
+        if not tickers:
+            parser.error("selected batch is empty")
+    elif not 10 <= args.limit <= 25:
         parser.error("--limit must be between 10 and 25")
+    else:
+        tickers = PILOT_TICKERS[:args.limit]
     if args.delay_min < 0 or args.delay_max < args.delay_min:
         parser.error("invalid delay range")
 
-    tickers = PILOT_TICKERS[:args.limit]
     raw_dir = args.data_dir / "raw_html"
     checkpoint_path = args.data_dir / "etfdb_pilot.checkpoint"
     jsonl_path = args.data_dir / "etfdb_pilot.jsonl"

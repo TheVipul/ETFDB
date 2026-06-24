@@ -3,3 +3,7 @@ __pycache__/
 data/.DS_Store
 data/raw_html/
 data/*.checkpoint
+data/etfdb-main.js
+data/screener-page-logic.js
+data/screener_api_page*.json
+data/screener_probe.html
