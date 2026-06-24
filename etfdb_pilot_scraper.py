@@ -45,6 +45,7 @@ FIELDNAMES = [
     "top_15_holdings", "holdings_comparison", "valuation", "dividend",
     "fund_flows", "aum_influence", "realtime_rating", "expenses_and_fees",
     "tax_analysis", "esg_summary_submetrics", "source_url", "fetched_at",
+    "performance",
 ]
 DIAGNOSTIC_HEADER_NAMES = {
     "content-type", "content-length", "date", "server", "cf-ray", "cf-cache-status",
@@ -251,6 +252,21 @@ def table_rows(table: Any) -> list[dict[str, str]]:
     return rows
 
 
+def performance_rows(table: Any, ticker: str) -> list[dict[str, str]]:
+    rows = []
+    for row in table_rows(table):
+        period = row.get("") or row.get("column_1")
+        fund_return = row.get(ticker)
+        category_average = row.get("ETF Database Category Average")
+        if period and (fund_return or category_average):
+            rows.append({
+                "period": period,
+                "fund_return": fund_return,
+                "category_average": category_average,
+            })
+    return rows
+
+
 def parse_structured_page(html: str) -> dict[str, Any]:
     if BeautifulSoup is None:
         return {}
@@ -310,6 +326,12 @@ def parse_structured_page(html: str) -> dict[str, Any]:
     comparison_rows = table_rows(holdings_comparison)
     if comparison_rows:
         structured["holdings_comparison"] = comparison_rows
+
+    ticker = (soup_text(soup.select_one("h1")).split() or [""])[0]
+    performance_table = soup.select_one("#performance_tab table")
+    performance = performance_rows(performance_table, ticker)
+    if performance:
+        structured["performance"] = performance
 
     return {key: value for key, value in structured.items() if value not in (None, "", [], {})}
 
