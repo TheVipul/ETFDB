@@ -45,7 +45,7 @@ FIELDNAMES = [
     "top_15_holdings", "holdings_comparison", "valuation", "dividend",
     "fund_flows", "aum_influence", "realtime_rating", "expenses_and_fees",
     "tax_analysis", "esg_summary_submetrics", "source_url", "fetched_at",
-    "performance",
+    "performance", "holdings_analysis_charts",
 ]
 DIAGNOSTIC_HEADER_NAMES = {
     "content-type", "content-length", "date", "server", "cf-ray", "cf-cache-status",
@@ -236,7 +236,12 @@ def table_rows(table: Any) -> list[dict[str, str]]:
         return []
     headers = [clean_header(soup_text(th)) for th in table.select("thead th")]
     rows: list[dict[str, str]] = []
-    for tr in table.select("tbody tr"):
+    body_rows = table.select("tbody tr")
+    candidate_rows = body_rows or [
+        tr for tr in table.find_all("tr", recursive=False)
+        if not tr.find_parent("thead") and not tr.find("th")
+    ]
+    for tr in candidate_rows:
         cells = tr.find_all(["td", "th"], recursive=False)
         values = [soup_text(cell) for cell in cells]
         if not any(values):
@@ -250,6 +255,74 @@ def table_rows(table: Any) -> list[dict[str, str]]:
                 row[key or f"column_{i+1}"] = values[i]
             rows.append(row)
     return rows
+
+
+def two_column_table(table: Any) -> dict[str, str]:
+    data = {}
+    for row in table_rows(table):
+        values = list(row.values())
+        if len(values) >= 2 and values[0]:
+            data[normalize_label(values[0])] = values[1]
+    return data
+
+
+def metric_comparison_rows(table: Any, fund_key: str, value_key: str = "value") -> list[dict[str, str]]:
+    rows = []
+    for row in table_rows(table):
+        label = row.get("") or row.get("column_1")
+        fund_value = row.get(fund_key) or row.get("Fund")
+        category_average = row.get("ETF Database Category Average")
+        segment_average = row.get("FactSet Segment Average")
+        if label and (fund_value or category_average or segment_average):
+            rows.append({
+                "metric": label,
+                value_key: fund_value,
+                "category_average": category_average,
+                "factset_segment_average": segment_average,
+            })
+    return rows
+
+
+def regex_metrics(text: str, suffix: str) -> dict[str, str]:
+    metrics = {}
+    pattern = rf"((?:5 Day|1 Month|3 Month|6 Month|1 Year|3 Year|5 Year|10 Year) {re.escape(suffix)}):\s*([-+]?\$?\s?[\d,.]+%?(?:\s?[BMK])?|N/A)"
+    for label, value in re.findall(pattern, text):
+        metrics[normalize_label(label.replace(suffix, ""))] = clean_text(value)
+    return metrics
+
+
+def valuation_metrics(section: Any, ticker: str) -> dict[str, str]:
+    if not section:
+        return {}
+    text = soup_text(section)
+    patterns = {
+        "fund_pe_ratio": rf"{re.escape(ticker)} P/E Ratio\s+([^\s]+)",
+        "category_average_pe_ratio": r"ETF Database Category Average P/E Ratio\s+([^\s]+)",
+        "factset_segment_average_pe_ratio": r"FactSet Segment Average P/E Ratio\s+([^\s]+)",
+    }
+    data = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.I)
+        if match:
+            data[key] = match.group(1)
+    return data
+
+
+def expense_metrics(section: Any, ticker: str) -> dict[str, str]:
+    if not section:
+        return {}
+    text = soup_text(section)
+    patterns = {
+        "fund_expense_ratio": rf"{re.escape(ticker)} Expense Ratio\s+([^\s]+)",
+        "category_average_expense_ratio": r"ETF Database Category Average Expense Ratio\s+([^\s]+)",
+        "factset_segment_average_expense_ratio": r"FactSet Segment Average Expense Ratio\s+([^\s]+)",
+    }
+    data = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.I)
+        if match:
+            data[key] = match.group(1)
+    return data
 
 
 def performance_rows(table: Any, ticker: str) -> list[dict[str, str]]:
@@ -267,6 +340,128 @@ def performance_rows(table: Any, ticker: str) -> list[dict[str, str]]:
     return rows
 
 
+def rating_data(section: Any) -> dict[str, Any]:
+    if not section:
+        return {}
+    overall = None
+    score = section.select_one(".realtime-rating-score .badge")
+    if score:
+        overall = soup_text(score)
+    ratings = []
+    for row in table_rows(section.select_one("table")):
+        metric = row.get("Metric")
+        if metric:
+            ratings.append({
+                "metric": metric,
+                "rating": row.get("Metric Realtime Rating"),
+                "a_plus_metric_rated_etf": row.get("A+ Metric Rated ETF"),
+            })
+    result: dict[str, Any] = {}
+    if overall:
+        result["overall_rating"] = overall
+    if ratings:
+        result["metrics"] = ratings
+    overall_link = section.select_one(".a-plus-rating a[href*='/etf/']")
+    if overall_link:
+        result["a_plus_overall_rated_etf"] = soup_text(overall_link)
+    return result
+
+
+def esg_data(section: Any) -> dict[str, Any]:
+    if not section:
+        return {}
+    text = soup_text(section)
+    result: dict[str, Any] = {}
+    summary_patterns = {
+        "esg_score": r"([\d.]+/10)\s+ESG Score",
+        "global_percentile": r"([\d.]+%)\s+Global Percentile",
+        "peer_percentile": r"([\d.]+%)\s+Peer Percentile",
+    }
+    for key, pattern in summary_patterns.items():
+        match = re.search(pattern, text, re.I)
+        if match:
+            result[key] = match.group(1)
+
+    submetrics = []
+    seen_esg = {}
+    for item in section.select("li"):
+        row = item.select_one(".esg-colum-row")
+        if not row:
+            continue
+        label_node = row.find("span")
+        value_node = row.select_one(".pull-right")
+        hint_node = item.select_one(".esg-hint")
+        label = soup_text(label_node)
+        value = soup_text(value_node)
+        if not label or not value:
+            continue
+        group = None
+        parent = item.parent
+        if parent:
+            group_node = parent.find_previous("div", class_="weak")
+            if group_node:
+                group = soup_text(group_node)
+        entry = {
+            "group": group,
+            "metric": label,
+            "value": value,
+            "interpretation": soup_text(hint_node) or None,
+        }
+        key = (entry["metric"], entry["value"], entry["interpretation"])
+        if key not in seen_esg or (seen_esg[key]["group"] is None and group):
+            seen_esg[key] = entry
+    submetrics = list(seen_esg.values())
+    if submetrics:
+        result["submetrics"] = submetrics
+    return result
+
+
+def technical_metrics(section: Any) -> dict[str, Any]:
+    if not section:
+        return {}
+    summary = two_column_table(section.select_one("table"))
+    indicators: dict[str, dict[str, str]] = {}
+    for block in section.select(".col-md-6.col-xs-12"):
+        heading = block.find(["h3", "h4"])
+        group = normalize_label(soup_text(heading)) if heading else None
+        if not group or group in {"spy_technicals", "volatility_analysis"}:
+            continue
+        values = {}
+        for value_node in block.select("span.pull-right"):
+            label_node = value_node.find_previous_sibling("span")
+            label = soup_text(label_node)
+            value = soup_text(value_node)
+            if label and value:
+                values[normalize_label(label)] = value
+        if values:
+            indicators[group] = values
+    result: dict[str, Any] = {}
+    if summary:
+        result["volatility"] = summary
+    if indicators:
+        result["indicators"] = indicators
+    return result
+
+
+def chart_tables(section: Any) -> dict[str, list[dict[str, str]]]:
+    charts = {}
+    if not section:
+        return charts
+    for table in section.select("table.chart"):
+        title = table.get("data-title") or ""
+        title = clean_text(re.sub(r"<br\s*/?>", " ", html_lib.unescape(title), flags=re.I))
+        if not title:
+            headers = [soup_text(th) for th in table.select("thead th")]
+            title = headers[0] if headers else "chart"
+        rows = table_rows(table)
+        if rows:
+            key = normalize_label(title)
+            if key in charts:
+                key = f"{key}_{len(charts) + 1}"
+            charts[key] = rows
+    return charts
+
+
 def parse_structured_page(html: str) -> dict[str, Any]:
     if BeautifulSoup is None:
         return {}
@@ -276,6 +471,7 @@ def parse_structured_page(html: str) -> dict[str, Any]:
     h1 = soup.find("h1")
     if h1:
         structured["name"] = soup_text(h1)
+    ticker = (structured.get("name", "").split() or [""])[0]
 
     overview = soup.select_one("#overview")
     if overview:
@@ -325,13 +521,59 @@ def parse_structured_page(html: str) -> dict[str, Any]:
     holdings_comparison = soup.select_one("#holdings-table")
     comparison_rows = table_rows(holdings_comparison)
     if comparison_rows:
-        structured["holdings_comparison"] = comparison_rows
+        structured["holdings_comparison"] = [
+            {
+                "metric": row.get("") or row.get("column_1"),
+                "fund_value": row.get(ticker),
+                "category_average": row.get("ETF Database Category Average"),
+            }
+            for row in comparison_rows
+        ]
 
-    ticker = (soup_text(soup.select_one("h1")).split() or [""])[0]
     performance_table = soup.select_one("#performance_tab table")
     performance = performance_rows(performance_table, ticker)
     if performance:
         structured["performance"] = performance
+
+    valuation = valuation_metrics(soup.select_one("#valuation"), ticker)
+    if valuation:
+        structured["valuation"] = valuation
+
+    dividend = metric_comparison_rows(soup.select_one("#dividend table"), ticker, "fund_value")
+    if dividend:
+        structured["dividend"] = dividend
+
+    fund_flows = regex_metrics(soup_text(soup.select_one("#fund-flows_tab")), "Net Flows")
+    if fund_flows:
+        structured["fund_flows"] = fund_flows
+
+    aum_influence = regex_metrics(soup_text(soup.select_one("#price-vs-flows_tab")), "Net AUM Change")
+    if aum_influence:
+        structured["aum_influence"] = aum_influence
+
+    ratings = rating_data(soup.select_one("#realtime-rating_tab"))
+    if ratings:
+        structured["realtime_rating"] = ratings
+
+    expense = expense_metrics(soup.select_one("#expense_tab"), ticker)
+    if expense:
+        structured["expenses_and_fees"] = expense
+
+    tax = two_column_table(soup.select_one("#expense_tab table"))
+    if tax:
+        structured["tax_analysis"] = tax
+
+    esg = esg_data(soup.select_one("#esg_tab"))
+    if esg:
+        structured["esg_summary_submetrics"] = esg
+
+    technicals = technical_metrics(soup.select_one("#technicals_tab"))
+    if technicals:
+        structured["trading_data"] = {**(structured.get("trading_data") or {}), "technicals": technicals}
+
+    charts = chart_tables(soup.select_one("#charts_tab"))
+    if charts:
+        structured["holdings_analysis_charts"] = charts
 
     return {key: value for key, value in structured.items() if value not in (None, "", [], {})}
 
