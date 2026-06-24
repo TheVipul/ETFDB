@@ -21,6 +21,12 @@ Run:
 python etfdb_pilot_scraper.py
 ```
 
+Rebuild outputs from already-cached HTML without making network requests:
+
+```bash
+python etfdb_pilot_scraper.py --limit 10 --parse-cache
+```
+
 Diagnostics only, without fetching ETF detail pages:
 
 ```bash
