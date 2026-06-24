@@ -40,6 +40,10 @@ FIELDNAMES = [
     "fund_flows", "aum_influence", "realtime_rating", "expenses_and_fees",
     "tax_analysis", "esg_summary_submetrics", "source_url", "fetched_at",
 ]
+DIAGNOSTIC_HEADER_NAMES = {
+    "content-type", "content-length", "date", "server", "cf-ray", "cf-cache-status",
+    "location", "retry-after", "x-cache", "x-served-by", "via",
+}
 
 
 
@@ -51,15 +55,26 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def get_with_retries(url: str, *, retries: int, timeout: int, block_limit: int) -> tuple[int, str, dict[str, str]]:
+def request_with_retries(
+    url: str,
+    *,
+    method: str,
+    retries: int,
+    timeout: int,
+    block_limit: int,
+) -> tuple[int, str, dict[str, str], str]:
     block_count = 0
     last_error = None
     for attempt in range(1, retries + 1):
-        req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
+        req = Request(
+            url,
+            method=method,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain"},
+        )
         try:
             with urlopen(req, timeout=timeout) as response:
                 body = response.read().decode(response.headers.get_content_charset() or "utf-8", "replace")
-                return response.status, body, dict(response.headers.items())
+                return response.status, body, dict(response.headers.items()), response.url
         except HTTPError as exc:
             last_error = f"HTTP {exc.code}: {exc.reason}"
             if exc.code in BLOCK_STATUSES:
@@ -76,6 +91,55 @@ def get_with_retries(url: str, *, retries: int, timeout: int, block_limit: int) 
         print(f"retrying {url} after {last_error}; sleeping {sleep_for:.1f}s", file=sys.stderr)
         time.sleep(sleep_for)
     raise RuntimeError(f"failed to fetch {url}: {last_error}")
+
+
+def get_with_retries(url: str, *, retries: int, timeout: int, block_limit: int) -> tuple[int, str, dict[str, str]]:
+    status, body, headers, _ = request_with_retries(
+        url, method="GET", retries=retries, timeout=timeout, block_limit=block_limit
+    )
+    return status, body, headers
+
+
+def diagnostic_headers(headers: dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in headers.items() if key.lower() in DIAGNOSTIC_HEADER_NAMES}
+
+
+def run_diagnostics(args: argparse.Namespace) -> int:
+    print("Diagnostics mode: no ETF detail pages will be fetched with GET.")
+    urls = [
+        ("robots", f"{BASE_URL}/robots.txt", "GET"),
+        ("spy_head", f"{BASE_URL}/etf/SPY/", "HEAD"),
+    ]
+    results = []
+    for name, url, method in urls:
+        print(f"diagnostic {method} {url}")
+        try:
+            status, body, headers, final_url = request_with_retries(
+                url,
+                method=method,
+                retries=args.retries,
+                timeout=args.timeout,
+                block_limit=args.block_limit,
+            )
+            result = {
+                "name": name,
+                "method": method,
+                "url": url,
+                "final_url": final_url,
+                "status": status,
+                "headers": diagnostic_headers(headers),
+            }
+            if name == "robots" and status == 200:
+                result["robots_preview"] = body[:300]
+            results.append(result)
+        except Exception as exc:
+            results.append({"name": name, "method": method, "url": url, "error": str(exc)})
+            if name == "robots":
+                print("robots.txt could not be read safely; stopping diagnostics before any ETF page GET.", file=sys.stderr)
+                print(json.dumps({"diagnostics": results, "aborted": True}, indent=2))
+                return 2
+    print(json.dumps({"diagnostics": results, "aborted": False}, indent=2))
+    return 0
 
 
 def load_checkpoint(path: Path) -> set[str]:
@@ -191,7 +255,10 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--block-limit", type=int, default=2)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--diagnostics", action="store_true", help="check access only; do not fetch ETF detail pages")
     args = parser.parse_args()
+    if args.diagnostics:
+        return run_diagnostics(args)
     if not 10 <= args.limit <= 25:
         parser.error("--limit must be between 10 and 25")
     if args.delay_min < 0 or args.delay_max < args.delay_min:

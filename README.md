@@ -21,6 +21,15 @@ Run:
 python etfdb_pilot_scraper.py
 ```
 
+Diagnostics only, without fetching ETF detail pages:
+
+```bash
+python etfdb_pilot_scraper.py --diagnostics
+```
+
+Diagnostics mode requests `robots.txt` with `GET` and checks the SPY detail URL
+with `HEAD` only. If `robots.txt` is blocked, it stops immediately.
+
 The default pilot list is exactly 25 tickers: SPY, VOO, IVV, VTI, QQQ, IWM, EFA,
 EEM, AGG, BND, GLD, SLV, TLT, HYG, VNQ, XLF, XLK, XLE, XLV, XLY, SCHD, JEPI,
 TQQQ, SQQQ, ARKK.
